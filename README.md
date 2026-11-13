@@ -25,6 +25,23 @@ Para achar o ID da loja "Shopee - Store": depois de criá-la no Bling, abra
 `/api/bling-vinculo` no painel (ex.: `/api/bling-vinculo?sku=ISA0001`) e copie o ID dela.
 Coloque em **Regras de preço** ou na variável `BLING_LOJA_ID`.
 
+## Pausa diária (aba "Pausa")
+Segunda a quinta, o cron-job.org chama duas URLs (método GET, fuso America/Sao_Paulo):
+
+| Horário | URL |
+|---|---|
+| 09:00 | `APP_BASE_URL/pausa/iniciar?token=CRON_TOKEN` |
+| 13:00 | `APP_BASE_URL/pausa/retomar?token=CRON_TOKEN` |
+
+- **Pausar:** lê o saldo de todos os anúncios ativos da Shopee, grava na aba Pausa e zera o estoque.
+- **Retomar:** devolve o saldo gravado. Se o Bling já atualizou o estoque de um item durante a pausa
+  (saldo maior que zero na Shopee), o valor do Bling é mantido e o item sai da lista.
+- Se a chamada das 09:00 rodar duas vezes, o saldo gravado não é perdido.
+- Itens que falharam ao zerar aparecem como "Falhou ao pausar" e não recebem saldo de volta.
+- Os botões "Pausar agora" e "Retomar agora" da aba fazem o mesmo manualmente.
+- Com `DRY_RUN=1` as chamadas só leem e simulam. Para a pausa valer de verdade, use `DRY_RUN=0`.
+- Use um plano do Render que não durma: a chamada precisa encontrar o serviço no ar às 09:00 e às 13:00.
+
 ## Enquanto a Shopee está em análise
 - Deixe `DRY_RUN=1`. A análise roda só com ML + Bling (sem Shopee conectada, o app considera
   que nenhum SKU existe lá) e o envio apenas simula.

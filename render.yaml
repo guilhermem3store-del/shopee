@@ -16,6 +16,8 @@ services:
         sync: false
       - key: ADMIN_PASS
         sync: false
+      - key: CRON_TOKEN
+        sync: false          # senha longa e aleatória; o cron-job.org usa para chamar /pausa/iniciar e /pausa/retomar
       - key: DATABASE_URL
         sync: false          # Postgres (Render ou Neon). Sem isso o app usa SQLite, que o Render apaga a cada deploy
       - key: ML_CLIENT_ID

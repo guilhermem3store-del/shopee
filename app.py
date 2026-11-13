@@ -26,6 +26,7 @@ app = Flask(__name__)
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+CRON_TOKEN = os.environ.get("CRON_TOKEN", "")   # chave para o cron-job.org chamar /pausa/iniciar e /pausa/retomar
 LOCAL_DEV = os.environ.get("LOCAL_DEV") == "1"
 DRY_RUN_ENV = os.environ.get("DRY_RUN", "1") != "0"
 
@@ -667,7 +668,7 @@ def _new_job():
     return {"running": False, "kind": "", "msg": "", "done": 0, "total": 0, "log": []}
 
 
-JOBS = {"analisar": _new_job(), "enviar": _new_job(), "sync": _new_job(), "full": _new_job()}
+JOBS = {"analisar": _new_job(), "enviar": _new_job(), "sync": _new_job(), "full": _new_job(), "pausa": _new_job()}
 JOB_LOCK = threading.Lock()
 _tl = threading.local()
 
@@ -1050,11 +1051,170 @@ def job_enviar(skus):
 
 
 # ----------------------------------------------------------------------------
+# Pausa diária da Shopee (cron: seg-qui 09:00 pausa, 13:00 retoma)
+#   Pausar  = lê o saldo de cada anúncio na Shopee, grava e zera o estoque.
+#   Retomar = devolve o saldo gravado. Se o Bling já tiver atualizado o item durante a
+#             pausa (saldo > 0 na Shopee), vale o do Bling e o item sai da lista.
+# ----------------------------------------------------------------------------
+def _saldo(x):
+    si = (x or {}).get("stock_info_v2") or {}
+    ss = si.get("seller_stock")
+    if ss:
+        return sum(int(i.get("stock") or 0) for i in ss)
+    return int((si.get("summary_info") or {}).get("total_available_stock") or 0)
+
+
+def shopee_estoques():
+    """Saldo atual de todos os anúncios ativos da Shopee, por item/variação: {'item:modelo': {...}}."""
+    ids, off = [], 0
+    while True:
+        rr = sp("/api/v2/product/get_item_list",
+                params={"offset": off, "page_size": 100, "item_status": "NORMAL"}).get("response") or {}
+        ids += [i["item_id"] for i in rr.get("item", [])]
+        if rr.get("has_next_page"):
+            off = rr["next_offset"]
+        else:
+            break
+    out = {}
+    for i in range(0, len(ids), 50):
+        base = sp("/api/v2/product/get_item_base_info",
+                  params={"item_id_list": ",".join(str(x) for x in ids[i:i + 50])}).get("response") or {}
+        for it in base.get("item_list", []):
+            iid = it["item_id"]
+            if it.get("has_model"):
+                mods = sp("/api/v2/product/get_model_list", params={"item_id": iid}).get("response") or {}
+                for m in mods.get("model", []):
+                    out[f"{iid}:{m['model_id']}"] = {"item_id": iid, "model_id": m["model_id"],
+                                                      "sku": m.get("model_sku") or it.get("item_sku") or "",
+                                                      "saldo": _saldo(m)}
+            else:
+                out[f"{iid}:0"] = {"item_id": iid, "model_id": 0, "sku": it.get("item_sku") or "", "saldo": _saldo(it)}
+        J()["msg"] = f"Lendo a Shopee: {min(i + 50, len(ids))} de {len(ids)} anúncios"
+    return out
+
+
+def sp_set_stock(item_id, pares):
+    """pares: lista de (model_id, estoque). model_id 0 = anúncio sem variações."""
+    sp("/api/v2/product/update_stock", "POST", body={
+        "item_id": int(item_id),
+        "stock_list": [{"model_id": int(m), "seller_stock": [{"stock": int(q)}]} for m, q in pares]})
+
+
+def _por_item(chaves, itens):
+    g = {}
+    for k in chaves:
+        g.setdefault(itens[k]["item_id"], []).append(k)
+    return g
+
+
+def job_pausar():
+    if not kv_get("shopee_tok"):
+        raise RuntimeError("Shopee não conectada")
+    dry = dry_run_on()
+    jlog("Lendo o saldo atual dos anúncios ativos da Shopee...")
+    atual = shopee_estoques()
+    snap = kv_get("pausa_snap", {}) or {}
+    itens = dict(snap.get("itens") or {})
+    a_pausar = []
+    for k, e in atual.items():
+        if e["saldo"] <= 0:
+            continue                       # já está zerado: nada a fazer (nem a gravar)
+        if k in itens:                     # o Bling repôs saldo durante a pausa: vale o mais novo
+            itens[k].update(saldo=e["saldo"], pausado=True)
+        else:
+            itens[k] = dict(e, pausado=True)
+        a_pausar.append(k)
+    pecas = sum(itens[k]["saldo"] for k in a_pausar)
+    jlog(f"{len(atual)} anúncios/variações lidos; {len(a_pausar)} com saldo para pausar ({pecas} peças)")
+    J()["total"] = len(a_pausar)
+    if dry:
+        jlog("(simulação) nada foi gravado nem zerado na Shopee")
+        return
+    snap = {"quando_pausa": now(), "quando_retoma": snap.get("quando_retoma"), "itens": itens}
+    kv_set("pausa_snap", snap)             # grava ANTES de zerar: se algo cair no meio, o saldo não se perde
+    ok = erro = mostrados = 0
+    for iid, ks in _por_item(a_pausar, itens).items():
+        try:
+            sp_set_stock(iid, [(itens[k]["model_id"], 0) for k in ks])
+            ok += len(ks)
+        except Exception as e:
+            erro += len(ks)
+            for k in ks:
+                itens[k]["pausado"] = False
+            if mostrados < 15:
+                mostrados += 1
+                jlog(f"item {iid}: {e}"[:220])
+        J()["done"] += len(ks)
+        time.sleep(0.25)
+    if erro:
+        kv_set("pausa_snap", snap)
+    jlog(f"Pausa concluída: {ok} zerados, {erro} com erro")
+
+
+def job_retomar():
+    if not kv_get("shopee_tok"):
+        raise RuntimeError("Shopee não conectada")
+    dry = dry_run_on()
+    snap = kv_get("pausa_snap", {}) or {}
+    itens = dict(snap.get("itens") or {})
+    falhou = [k for k, e in itens.items() if not e.get("pausado")]
+    for k in falhou:
+        itens.pop(k)                       # não chegou a ser pausado: nada a devolver
+    if not itens:
+        jlog("Nada para retomar")
+        if falhou and not dry:
+            kv_set("pausa_snap", {"quando_pausa": snap.get("quando_pausa"), "quando_retoma": now(), "itens": {}})
+        return
+    jlog("Lendo o saldo atual da Shopee...")
+    atual = shopee_estoques()
+    devolver, atualizados, sumiram = [], [], []
+    for k, e in itens.items():
+        cur = atual.get(k)
+        if cur is None:
+            sumiram.append(k)
+        elif cur["saldo"] > 0:
+            atualizados.append(k)          # o Bling já atualizou: não sobrescrevo com o saldo antigo
+        else:
+            devolver.append(k)
+    pecas = sum(itens[k]["saldo"] for k in devolver)
+    jlog(f"{len(devolver)} para devolver ({pecas} peças); {len(atualizados)} já atualizados pelo Bling; {len(sumiram)} não estão mais ativos")
+    J()["total"] = len(devolver)
+    if dry:
+        jlog("(simulação) nada foi devolvido na Shopee")
+        return
+    for k in atualizados + sumiram:
+        itens.pop(k)
+    ok = erro = mostrados = 0
+    for iid, ks in _por_item(devolver, itens).items():
+        try:
+            sp_set_stock(iid, [(itens[k]["model_id"], itens[k]["saldo"]) for k in ks])
+            ok += len(ks)
+            for k in ks:
+                itens.pop(k)
+        except Exception as e:
+            erro += len(ks)
+            if mostrados < 15:
+                mostrados += 1
+                jlog(f"item {iid}: {e}"[:220])
+        J()["done"] += len(ks)
+        time.sleep(0.25)
+    kv_set("pausa_snap", {"quando_pausa": snap.get("quando_pausa"), "quando_retoma": now(), "itens": itens})
+    jlog(f"Retomada concluída: {ok} devolvidos, {erro} com erro" + (" (tente retomar de novo)" if erro else ""))
+
+
+# ----------------------------------------------------------------------------
 # Rotas
 # ----------------------------------------------------------------------------
+def _cron_ok():
+    t = request.args.get("token", "")
+    return bool(CRON_TOKEN) and hmac.compare_digest(t.encode(), CRON_TOKEN.encode())
+
+
 @app.before_request
 def protege():
     if request.path == "/health":
+        return None
+    if request.path in ("/pausa/iniciar", "/pausa/retomar") and _cron_ok():
         return None
     if not ADMIN_PASS and not LOCAL_DEV:
         return Response("Defina ADMIN_PASS nas variáveis do Render.", 503)
@@ -1116,7 +1276,7 @@ def api_state():
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
-        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "full_quando": (kv_get("full_snap", {}) or {}).get("quando"), "cands": cands, "max_lote": MAX_LOTE})
+        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "job_pausa": JOBS["pausa"], "cron_ok": bool(CRON_TOKEN), "full_quando": (kv_get("full_snap", {}) or {}).get("quando"), "cands": cands, "max_lote": MAX_LOTE})
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -1322,6 +1482,41 @@ def api_send():
     return jsonify({"ok": True, "enviando": len(skus)})
 
 
+def _dispara_pausa(acao):
+    fn = {"iniciar": job_pausar, "retomar": job_retomar}.get(acao)
+    if not fn:
+        return jsonify({"erro": "ação inválida"}), 404
+    ok = start_job("pausa", fn)
+    if not ok:
+        return jsonify({"ok": False, "erro": "A pausa/retomada já está em andamento"}), 409
+    return jsonify({"ok": True, "msg": "iniciado", "simulacao": dry_run_on()})
+
+
+@app.route("/pausa/<acao>")
+def rota_pausa(acao):
+    """Chamado pelo cron-job.org (GET com ?token=). Seg-Qui 09:00 = iniciar, 13:00 = retomar."""
+    if not _cron_ok():
+        return jsonify({"erro": "token inválido"}), 403
+    return _dispara_pausa(acao)
+
+
+@app.route("/api/pausa/<acao>", methods=["POST"])
+def api_pausa_acao(acao):
+    return _dispara_pausa(acao)
+
+
+@app.route("/api/pausa")
+def api_pausa():
+    snap = kv_get("pausa_snap", {}) or {}
+    lin = [{"sku": e.get("sku") or "", "item_id": e["item_id"], "model_id": e["model_id"],
+            "saldo": e["saldo"], "pausado": bool(e.get("pausado"))} for e in (snap.get("itens") or {}).values()]
+    lin.sort(key=lambda x: (x["sku"], x["item_id"], x["model_id"]))
+    return jsonify({"quando_pausa": snap.get("quando_pausa"), "quando_retoma": snap.get("quando_retoma"),
+                    "total": len(lin), "pausados": sum(1 for x in lin if x["pausado"]),
+                    "pecas": sum(x["saldo"] for x in lin if x["pausado"]), "itens": lin[:1000]})
+
+
+
 PAGE = r"""<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1378,7 +1573,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 </style></head><body>
 <header><div class="top">
 <div class="brand"><span class="logo"></span>Criador de anúncios</div>
-<nav><button id="t-anuncios" onclick="go('anuncios')">Anúncios</button><button id="t-conexoes" onclick="go('conexoes')">Conexões</button><button id="t-full" onclick="go('full')">Reposição Full</button><button id="t-regras" onclick="go('regras')">Regras de preço</button></nav>
+<nav><button id="t-anuncios" onclick="go('anuncios')">Anúncios</button><button id="t-conexoes" onclick="go('conexoes')">Conexões</button><button id="t-full" onclick="go('full')">Reposição Full</button><button id="t-pausa" onclick="go('pausa')">Pausa</button><button id="t-regras" onclick="go('regras')">Regras de preço</button></nav>
 <span class="sp"></span><div class="dots" id="dots"></div><span id="modo"></span>
 </div></header>
 <main>
@@ -1408,6 +1603,17 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="tw"><table><thead><tr><th><input type="checkbox" onchange="selAll(this.checked)" aria-label="Marcar todos"></th><th>SKU</th><th>Título</th><th>MLBs</th><th class="n">Vendas 30d</th><th class="n">Último pedido</th><th class="n">Saldo Full</th><th class="n">Meta</th><th class="n">Sugerido</th><th class="n">Bling</th><th class="n">Enviar</th><th>Situação</th><th>Dados fiscais</th></tr></thead><tbody id="ftb"></tbody></table></div></div>
 <div class="card"><h2>Finalizar pedido</h2><div class="row"><input type="text" id="fped_nome" placeholder="Nome (ex.: Pedido 01)" style="width:210px"><input type="date" id="fped_data" style="width:170px"><button class="pri" onclick="finalizarPedido()">Finalizar e salvar no histórico</button></div>
 <p class="mut">Salva as quantidades da coluna Enviar. Depois elas aparecem em Último pedido.</p><div id="fhist"></div></div>
+</section>
+
+<section id="p-pausa" hidden>
+<div class="tiles" id="ptiles"></div>
+<div class="card"><div class="row"><button class="pri" id="bPausar" onclick="pausar()">Pausar agora</button><button id="bRetomar" onclick="retomar()">Retomar agora</button><span id="pmsg" class="mut"></span></div>
+<div class="bar"><i id="pprog"></i></div>
+<details><summary class="mut" style="cursor:pointer">Ver detalhes</summary><div id="plog" style="font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;color:var(--mut);max-height:140px;overflow:auto;white-space:pre-wrap;margin-top:8px"></div></details>
+<p class="mut" style="margin-bottom:0">Pausar lê o saldo de todos os anúncios ativos da Shopee, grava e zera o estoque. Retomar devolve o saldo gravado. Se o Bling já tiver atualizado o estoque de um item durante a pausa, o valor do Bling é mantido.</p></div>
+<div class="card"><h2>Agendamento (cron-job.org)</h2><div id="pcron"></div></div>
+<div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Saldo gravado</h2><span class="tag" id="pcont"></span></div>
+<div class="tw"><table><thead><tr><th>SKU</th><th>Anúncio (item)</th><th>Variação</th><th class="n">Saldo gravado</th><th>Situação</th></tr></thead><tbody id="ptb"></tbody></table></div></div>
 </section>
 
 <section id="p-conexoes" hidden><div class="card"><h2>Conexões</h2><div id="conns"></div>
@@ -1444,12 +1650,12 @@ const NOMES={ml:'Mercado Livre',bling:'Bling',shopee:'Shopee'};
 const SIT={pendente:['Pronto','ok'],bloqueado:['Bloqueado','warn'],sem_custo:['Sem custo','bad'],sem_foto:['Sem foto','bad'],sem_estoque:['Sem estoque','warn'],simulado:['Simulado','warn'],criado:['Criado','ok'],erro:['Erro','bad'],erro_preco:['Erro de preço','bad']};
 const PROB=['sem_custo','sem_foto','sem_estoque','bloqueado','erro','erro_preco'];
 const match=(c,f)=>f==='acima'?acima(c):f==='problemas'?PROB.includes(c.status):(!f||c.status===f);
-function go(t){tab=t;location.hash=t;if(t==='full')loadFull();draw()}
+function go(t){tab=t;location.hash=t;if(t==='full')loadFull();if(t==='pausa')loadPausa();draw()}
 function setF(f){filt=f;draw()}
 async function load(){const r=await fetch('/api/state');S=await r.json();draw();}
 function draw(){
  if(!S)return;
- ['anuncios','full','conexoes','regras'].forEach(t=>{$('p-'+t).hidden=tab!==t;$('t-'+t).classList.toggle('on',tab===t)});
+ ['anuncios','full','pausa','conexoes','regras'].forEach(t=>{$('p-'+t).hidden=tab!==t;$('t-'+t).classList.toggle('on',tab===t)});
  $('bar').hidden=tab!=='anuncios';
  $('modo').innerHTML=S.dry?'<span class="mode sim">Modo simulação: nada é criado</span>':'<span class="mode live">Modo real: cria na Shopee</span>';
  $('dots').innerHTML=Object.keys(NOMES).map(k=>`<span title="${NOMES[k]}"><i class="dot ${S.conn[k]?'ok':''}"></i>${k==='ml'?'ML':k==='bling'?'Bling':'Shopee'}</span>`).join('');
@@ -1474,13 +1680,31 @@ function draw(){
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
  if(!(document.activeElement&&$('tb').contains(document.activeElement)&&document.activeElement.type==='number'))$('tb').innerHTML=rows.length?rows.map(c=>{const g=SIT[c.status]||[c.status,''];const can=['pendente','simulado','erro','bloqueado'].includes(c.status);
   return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${c.preco==null?'-':`<input type="number" step="0.01" min="0" value="${Number(c.preco).toFixed(2)}" style="width:92px;padding:5px;text-align:right${c.preco_manual?';border-color:var(--acc)':''}" onchange="setPreco('${esc(c.sku)}',this.value)" title="${c.preco_manual?'Preço ajustado por você':'Preço calculado pelas regras'}">`}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${g[1]}">${g[0]}</span>${c.msg?`<div class="mut" style="font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" class="mut" style="padding:22px">Nenhum item neste filtro. Clique em Analisar para buscar os anúncios que faltam na Shopee.</td></tr>';
- upd();
+ upd();drawPausa();
 }
 function upd(){$('selinfo').textContent=sel.size+' selecionados';$('bEnv').disabled=!sel.size||(S&&S.job_send.running)}
 function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_lote+' por envio.');draw();return}sel.add(s)}else sel.delete(s);upd()}
 function sel50(){sel.clear();visAn.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)alert(j.erro||'Erro');return j}
+let PZ=null,pq='';
+const loc=s=>s?new Date(s.replace(' ','T')+'Z').toLocaleString('pt-BR'):'-';
+async function loadPausa(){const r=await fetch('/api/pausa');PZ=await r.json();drawPausa()}
+async function pausar(){if(!S.dry&&!confirm('Zerar agora o estoque de TODOS os anúncios ativos da Shopee? O saldo atual fica gravado para a retomada.'))return;await post('/api/pausa/iniciar');load()}
+async function retomar(){if(!S.dry&&!confirm('Devolver agora o saldo gravado aos anúncios da Shopee?'))return;await post('/api/pausa/retomar');load()}
+function drawPausa(){
+ if(tab!=='pausa'||!S)return;
+ const j=S.job_pausa,k=j.running+'|'+j.msg;
+ if(k!==pq||!PZ){pq=k;loadPausa();if(!PZ)return}
+ $('pmsg').textContent=j.running?j.msg:(j.log.length?j.msg:'');$('pprog').style.width=(j.total?Math.round(j.done/j.total*100):0)+'%';$('plog').textContent=j.log.join('\n');
+ $('bPausar').disabled=$('bRetomar').disabled=j.running;
+ const tl=(n,l,c)=>`<div class="tile ${c}"><span class="num"${typeof n==='string'?' style="font-size:15px;padding:6px 0"':''}>${esc(n)}</span><span>${l}</span></div>`;
+ $('ptiles').innerHTML=tl(PZ.pausados,'Itens em pausa',PZ.pausados?'warn':'ok')+tl(PZ.pecas,'Peças gravadas','')+tl(loc(PZ.quando_pausa),'Última pausa','')+tl(loc(PZ.quando_retoma),'Última retomada','');
+ const b=location.origin,tk=S.cron_ok?'SEU_CRON_TOKEN':'(defina CRON_TOKEN no Render)';
+ $('pcron').innerHTML=`<p class="mut" style="margin-top:0">Crie 2 tarefas no cron-job.org (método GET, fuso America/Sao_Paulo, dias segunda a quinta) com o mesmo valor de CRON_TOKEN do Render:</p><p style="margin:6px 0"><b>09:00</b> <code>${esc(b)}/pausa/iniciar?token=${tk}</code></p><p style="margin:6px 0"><b>13:00</b> <code>${esc(b)}/pausa/retomar?token=${tk}</code></p><p class="mut" style="margin-bottom:0">${S.cron_ok?'CRON_TOKEN configurado.':'CRON_TOKEN ainda não configurado: sem ele o cron não consegue chamar.'} ${S.dry?'Modo simulação ligado: as chamadas só simulam.':'Modo real: as chamadas alteram o estoque da Shopee.'}</p>`;
+ $('pcont').textContent=PZ.total+' itens'+(PZ.total>1000?' (mostrando 1000)':'');
+ $('ptb').innerHTML=PZ.itens.length?PZ.itens.map(l=>`<tr><td>${esc(l.sku)}</td><td>${l.item_id}</td><td>${l.model_id||'-'}</td><td class="n">${l.saldo}</td><td><span class="tag ${l.pausado?'warn':'bad'}">${l.pausado?'Em pausa':'Falhou ao pausar'}</span></td></tr>`).join(''):'<tr><td colspan="5" class="mut" style="padding:22px">Nada gravado. Quando a pausa rodar, o saldo de cada anúncio aparece aqui até a retomada.</td></tr>';
+}
 let F=null,fq=null,envMap={},fmin=Number(localStorage.getItem('fmin')||0);
 let visRows=[],visAn=[];
 const aj=sku=>{F.ajustes=F.ajustes||{};return F.ajustes[sku]=F.ajustes[sku]||{}};
